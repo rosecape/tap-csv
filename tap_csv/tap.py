@@ -24,7 +24,10 @@ class TapCSV(Tap):
             th.ArrayType(
                 th.ObjectType(
                     th.Property("entity", th.StringType, required=True),
-                    th.Property("path", th.StringType, required=True),
+                    # `path` is required for LOCAL file sources. For S3 sources
+                    # (when `s3_bucket` is set) it is ignored — leave it empty
+                    # or omit it. Kept non-required so S3-only configs validate.
+                    th.Property("path", th.StringType, required=False),
                     th.Property("keys", th.ArrayType(th.StringType), required=True),
                     th.Property(
                         "encoding", th.StringType, required=False, default="utf-8"
@@ -35,6 +38,32 @@ class TapCSV(Tap):
                     th.Property("quotechar", th.StringType, required=False),
                     th.Property("skipinitialspace", th.BooleanType, required=False),
                     th.Property("strict", th.BooleanType, required=False),
+                    # --- rosecape fork: S3 / S3-compatible source ---
+                    # When `s3_bucket` is present, the stream reads CSV objects
+                    # from S3 (or an S3-compatible store like DigitalOcean
+                    # Spaces / MinIO via `s3_endpoint_url`) instead of the
+                    # local filesystem. All `s3_*` fields below are scoped to
+                    # the individual file entry so different streams can target
+                    # different buckets.
+                    th.Property("s3_bucket", th.StringType, required=False),
+                    th.Property(
+                        "s3_prefix", th.StringType, required=False, default=""
+                    ),
+                    th.Property(
+                        "s3_search_pattern",
+                        th.StringType,
+                        required=False,
+                        description=(
+                            "Regex matched against each object key's basename. "
+                            "Defaults to '.*\\.csv$'."
+                        ),
+                    ),
+                    th.Property("s3_endpoint_url", th.StringType, required=False),
+                    th.Property("s3_access_key_id", th.StringType, required=False),
+                    th.Property(
+                        "s3_secret_access_key", th.StringType, required=False
+                    ),
+                    th.Property("s3_region", th.StringType, required=False),
                 )
             ),
             description="An array of csv file stream settings.",
@@ -62,6 +91,9 @@ class TapCSV(Tap):
         return [
             TapCapabilities.CATALOG,
             TapCapabilities.DISCOVER,
+            # Rosecape fork: file-level INCREMENTAL on _sdc_source_file_mtime
+            # (bookmark-aware file skipping in CSVStream.get_records).
+            TapCapabilities.STATE,
         ]
 
     def get_file_configs(self) -> list[dict]:

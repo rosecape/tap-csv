@@ -12,6 +12,7 @@ license = "Apache-2.0"
 [tool.poetry.dependencies]
 python = ">=3.10,<4"
 singer-sdk = "~=0.54.0"
+boto3 = ">=1.34"  # rosecape fork: S3 / S3-compatible (DigitalOcean Spaces) source support
 
 [tool.poetry.group.dev.dependencies]
 coverage = ">=7.2"

@@ -1,9 +1,18 @@
-"""Custom client handling, including CSVStream base class."""
+"""Custom client handling, including CSVStream base class.
+
+Rosecape fork: adds an S3 / S3-compatible source mode alongside the
+upstream local-filesystem behavior. When the stream's `file_config`
+contains `s3_bucket`, files are listed and read via boto3 (honoring an
+optional `s3_endpoint_url` so DigitalOcean Spaces / MinIO work unchanged).
+Local-filesystem behavior is preserved exactly when `s3_bucket` is absent.
+"""
 
 from __future__ import annotations
 
 import csv
+import io
 import os
+import re
 import typing as t
 from datetime import datetime, timezone
 from functools import cached_property
@@ -28,9 +37,91 @@ class CSVStream(Stream):
         self.file_config = kwargs.pop("file_config")
         self._file_paths: list[str] = []
         self._header: list[str] | None = None
+        # Rosecape fork: S3 object key -> LastModified, populated during
+        # listing so get_records can stamp _sdc_source_file_mtime without a
+        # second HEAD request per object.
+        self._s3_mtimes: dict[str, datetime] = {}
         super().__init__(*args, **kwargs)
 
         self._primary_keys: list[str] = self.file_config.get("keys", [])
+
+    # ------------------------------------------------------------------
+    # Rosecape fork: S3 source helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_s3(self) -> bool:
+        """True when this stream reads from S3 instead of local files."""
+        return bool(self.file_config.get("s3_bucket"))
+
+    @cached_property
+    def _s3_client(self):
+        """Build a boto3 S3 client honoring optional endpoint_url + creds.
+
+        boto3 transparently targets `s3_endpoint_url` when set, so the same
+        code path serves AWS S3, DigitalOcean Spaces, and MinIO.
+        """
+        import boto3
+
+        kwargs: dict = {}
+        if self.file_config.get("s3_endpoint_url"):
+            kwargs["endpoint_url"] = self.file_config["s3_endpoint_url"]
+        if self.file_config.get("s3_access_key_id"):
+            kwargs["aws_access_key_id"] = self.file_config["s3_access_key_id"]
+        if self.file_config.get("s3_secret_access_key"):
+            kwargs["aws_secret_access_key"] = self.file_config["s3_secret_access_key"]
+        if self.file_config.get("s3_region"):
+            kwargs["region_name"] = self.file_config["s3_region"]
+        return boto3.client("s3", **kwargs)
+
+    def _list_s3_keys(self) -> list[str]:
+        r"""List S3 object keys under the prefix matching the search pattern.
+
+        The pattern is matched against each key's BASENAME (so a
+        date-partitioned layout like `prod/YYYY/MM/DD/bluecard.csv` works
+        with a pattern of `^bluecard\\.csv$`). Pagination-safe.
+        Populates `self._s3_mtimes` as a side effect.
+        """
+        bucket = self.file_config["s3_bucket"]
+        prefix = self.file_config.get("s3_prefix", "") or ""
+        pattern = self.file_config.get("s3_search_pattern") or r".*\.csv$"
+        compiled = re.compile(pattern)
+
+        keys: list[str] = []
+        paginator = self._s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                key = obj["Key"]
+                basename = key.rsplit("/", 1)[-1]
+                if compiled.search(basename):
+                    keys.append(key)
+                    lm = obj.get("LastModified")
+                    if lm is not None:
+                        # boto3 returns tz-aware datetimes already.
+                        self._s3_mtimes[key] = lm
+        # Deterministic order — sorted by key (date-partitioned paths sort
+        # chronologically). Keeps Singer state bookmarks monotonic.
+        keys.sort()
+        return keys
+
+    def _get_s3_rows(self, key: str) -> t.Iterable[list[t.Any]]:
+        """Stream rows from an S3 CSV object via GetObject."""
+        bucket = self.file_config["s3_bucket"]
+        encoding = self.file_config.get("encoding", "utf-8")
+        resp = self._s3_client.get_object(Bucket=bucket, Key=key)
+        text = resp["Body"].read().decode(encoding)
+        csv.register_dialect(
+            "tap_dialect",
+            delimiter=self.file_config.get("delimiter", ","),
+            doublequote=self.file_config.get("doublequote", True),
+            escapechar=self.file_config.get("escapechar", None),
+            quotechar=self.file_config.get("quotechar", '"'),
+            skipinitialspace=self.file_config.get("skipinitialspace", False),
+            strict=self.file_config.get("strict", False),
+        )
+        yield from csv.reader(io.StringIO(text), dialect="tap_dialect")
+
+    # ------------------------------------------------------------------
 
     def get_records(self, context: Context | None) -> t.Iterable[dict]:
         """Return a generator of row-type dictionary objects.
@@ -40,10 +131,40 @@ class CSVStream(Stream):
         require partitioning and should ignore the `context` argument.
         """
         header = self.header
+
+        # Rosecape fork: bookmark-aware file skipping. Upstream tap-csv
+        # re-reads every file on every run (it only declares CATALOG +
+        # DISCOVER, no STATE). When the stream is configured INCREMENTAL on
+        # `_sdc_source_file_mtime`, we skip files whose mtime is strictly
+        # older than the bookmark. Files AT the bookmark mtime are re-emitted
+        # (Singer `>=` semantics) so a boundary file is never lost; target
+        # MERGE on the primary key keeps this idempotent.
+        starting_mtime: datetime | None = None
+        if self.replication_key == SDC_SOURCE_FILE_MTIME_COLUMN:
+            try:
+                starting_mtime = self.get_starting_timestamp(context)
+            except Exception:  # pragma: no cover - defensive; e.g. no state yet
+                starting_mtime = None
+
         for file_path in self.get_file_paths():
-            file_last_modified = datetime.fromtimestamp(
-                os.path.getmtime(file_path), timezone.utc
-            )
+            if self.is_s3:
+                # mtime captured during listing (S3 LastModified).
+                file_last_modified = self._s3_mtimes.get(
+                    file_path, datetime.now(timezone.utc)
+                )
+            else:
+                file_last_modified = datetime.fromtimestamp(
+                    os.path.getmtime(file_path), timezone.utc
+                )
+
+            # Skip files strictly older than the bookmark (already ingested).
+            if starting_mtime is not None and file_last_modified < starting_mtime:
+                self.logger.info(
+                    "Skipping %s (mtime %s < bookmark %s)",
+                    file_path, file_last_modified.isoformat(),
+                    starting_mtime.isoformat(),
+                )
+                continue
 
             file_lineno = -1
 
@@ -80,14 +201,29 @@ class CSVStream(Stream):
         self._file_paths = paths
 
     def get_file_paths(self) -> list[str]:
-        """Return a list of file paths to read.
+        """Return a list of file paths (local) or object keys (S3) to read.
 
         This tap accepts file names and directories so it will detect
-        directories and iterate files inside.
+        directories and iterate files inside. In S3 mode it lists object
+        keys under the configured prefix matching the search pattern.
         """
         # Cache file paths so we dont have to iterate multiple times
         if self.file_paths:
             return self.file_paths
+
+        # Rosecape fork: S3 source mode.
+        if self.is_s3:
+            keys = self._list_s3_keys()
+            if not keys:
+                bucket = self.file_config["s3_bucket"]
+                prefix = self.file_config.get("s3_prefix", "")
+                pattern = self.file_config.get("s3_search_pattern", r".*\.csv$")
+                raise RuntimeError(
+                    f"Stream '{self.name}' matched no S3 objects in "
+                    f"s3://{bucket}/{prefix} with pattern {pattern}."
+                )
+            self.file_paths = keys
+            return keys
 
         file_path = self.file_config["path"]
         if not os.path.exists(file_path):
@@ -120,7 +256,12 @@ class CSVStream(Stream):
         return is_valid
 
     def get_rows(self, file_path: str) -> t.Iterable[list[t.Any]]:
-        """Return a generator of the rows in a particular CSV file."""
+        """Return a generator of the rows in a particular CSV file/object."""
+        # Rosecape fork: S3 source mode reads via boto3 GetObject.
+        if self.is_s3:
+            yield from self._get_s3_rows(file_path)
+            return
+
         encoding = self.file_config.get("encoding", None)
         csv.register_dialect(
             "tap_dialect",
