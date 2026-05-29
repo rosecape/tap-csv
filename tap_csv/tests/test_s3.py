@@ -81,7 +81,7 @@ _CSV = (
 
 
 def _make_stream(objects, *, add_metadata=True, replication_key=None, state=None,
-                 monkeypatch=None):
+                 monkeypatch=None, cfg=None):
     """Build a CSVStream wired to a FakeS3.
 
     boto3.client is patched so that ANY S3 client the stream constructs
@@ -93,20 +93,21 @@ def _make_stream(objects, *, add_metadata=True, replication_key=None, state=None
     fake = FakeS3(objects)
     monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
 
-    cfg = {
-        "add_metadata_columns": add_metadata,
-        "files": [{
-            "entity": "thing",
-            "keys": ["TransID"],
-            "s3_bucket": "test-bucket",
-            "s3_prefix": "prod/",
-            "s3_search_pattern": r"^data\.csv$",
-            "s3_endpoint_url": "https://example.spaces.test",
-            "s3_region": "tor1",
-            "s3_access_key_id": "fake",
-            "s3_secret_access_key": "fake",
-        }],
-    }
+    if cfg is None:
+        cfg = {
+            "add_metadata_columns": add_metadata,
+            "files": [{
+                "entity": "thing",
+                "keys": ["TransID"],
+                "s3_bucket": "test-bucket",
+                "s3_prefix": "prod/",
+                "s3_search_pattern": r"^data\.csv$",
+                "s3_endpoint_url": "https://example.spaces.test",
+                "s3_region": "tor1",
+                "s3_access_key_id": "fake",
+                "s3_secret_access_key": "fake",
+            }],
+        }
     tap = TapCSV(config=cfg, catalog={}, state=state or {})
     stream = CSVStream(tap=tap, name="thing", file_config=cfg["files"][0])
     if replication_key:
@@ -210,3 +211,46 @@ def test_s3_header_parsed_from_first_object(monkeypatch):
     objs = [_Obj("prod/2026/04/10/data.csv", _CSV, datetime(2026, 4, 10, tzinfo=timezone.utc))]
     s = _make_stream(objs, add_metadata=False, monkeypatch=monkeypatch)
     assert s.header == ["TransID", "EntityID", "Value"]
+
+
+def test_top_level_s3_settings_merge_into_file_config(monkeypatch):
+    """Top-level s3_* settings act as defaults for a file entry that omits them."""
+    objs = [_Obj("prod/2026/04/10/data.csv", _CSV,
+                 datetime(2026, 4, 10, tzinfo=timezone.utc))]
+    # `files` carries only entity + keys; S3 connection settings live at the
+    # top level (the shape AIP/Meltano inject via TAP_CSV_S3_* env vars).
+    cfg = {
+        "add_metadata_columns": True,
+        "s3_bucket": "test-bucket",
+        "s3_prefix": "prod/",
+        "s3_search_pattern": r"^data\.csv$",
+        "s3_endpoint_url": "https://example.spaces.test",
+        "s3_region": "tor1",
+        "s3_access_key_id": "fake",
+        "s3_secret_access_key": "fake",
+        "files": [{"entity": "thing", "keys": ["TransID"]}],
+    }
+    s = _make_stream(objs, monkeypatch=monkeypatch, cfg=cfg)
+    assert s.is_s3 is True
+    assert s.file_config["s3_bucket"] == "test-bucket"
+    assert s.get_file_paths() == ["prod/2026/04/10/data.csv"]
+
+
+def test_per_file_s3_setting_overrides_top_level(monkeypatch):
+    """A per-file s3_* value wins over the top-level default."""
+    objs = [_Obj("prod/2026/04/10/data.csv", _CSV,
+                 datetime(2026, 4, 10, tzinfo=timezone.utc))]
+    cfg = {
+        "add_metadata_columns": True,
+        "s3_bucket": "top-level-bucket",
+        "s3_prefix": "prod/",
+        "s3_search_pattern": r"^data\.csv$",
+        "s3_endpoint_url": "https://example.spaces.test",
+        "s3_region": "tor1",
+        "s3_access_key_id": "fake",
+        "s3_secret_access_key": "fake",
+        "files": [{"entity": "thing", "keys": ["TransID"],
+                   "s3_bucket": "per-file-bucket"}],
+    }
+    s = _make_stream(objs, monkeypatch=monkeypatch, cfg=cfg)
+    assert s.file_config["s3_bucket"] == "per-file-bucket"
