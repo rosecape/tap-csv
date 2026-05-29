@@ -83,6 +83,21 @@ class TapCSV(Tap):
                 "`_sdc_source_file_mtime`, `_sdc_source_lineno`) to output."
             ),
         ),
+        # --- rosecape fork: top-level S3 defaults ---
+        # These mirror the per-file `s3_*` fields and act as defaults for
+        # every file entry (a per-file value overrides the top-level one).
+        # Deployment platforms map each to a single env var
+        # (TAP_CSV_S3_BUCKET, TAP_CSV_S3_ACCESS_KEY_ID, ...) backed by one
+        # vault key — there is no env-var path into a nested `files[i].s3_*`
+        # field. For a single-stream S3 source, set these and give `files`
+        # just `entity` + `keys`.
+        th.Property("s3_bucket", th.StringType, required=False),
+        th.Property("s3_prefix", th.StringType, required=False),
+        th.Property("s3_search_pattern", th.StringType, required=False),
+        th.Property("s3_endpoint_url", th.StringType, required=False),
+        th.Property("s3_access_key_id", th.StringType, required=False),
+        th.Property("s3_secret_access_key", th.StringType, required=False),
+        th.Property("s3_region", th.StringType, required=False),
     ).to_dict()
 
     @classproperty

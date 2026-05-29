@@ -27,6 +27,22 @@ SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
 SDC_SOURCE_LINENO_COLUMN = "_sdc_source_lineno"
 SDC_SOURCE_FILE_MTIME_COLUMN = "_sdc_source_file_mtime"
 
+# Rosecape fork: top-level S3 settings that act as defaults for every file
+# entry. Deployment platforms (Meltano/AIP) inject one env var per setting
+# (TAP_CSV_S3_BUCKET, TAP_CSV_S3_ACCESS_KEY_ID, ...), each mapped to a vault
+# key — there is no env-var path into a nested `files[i].s3_*` field, so the
+# tap merges these top-level values into each file_config. Per-file values
+# still win when both are present.
+S3_DEFAULT_KEYS = (
+    "s3_bucket",
+    "s3_prefix",
+    "s3_search_pattern",
+    "s3_endpoint_url",
+    "s3_access_key_id",
+    "s3_secret_access_key",
+    "s3_region",
+)
+
 
 class CSVStream(Stream):
     """Stream class for CSV streams."""
@@ -42,6 +58,16 @@ class CSVStream(Stream):
         # second HEAD request per object.
         self._s3_mtimes: dict[str, datetime] = {}
         super().__init__(*args, **kwargs)
+
+        # Rosecape fork: fold top-level S3 settings into this file's config as
+        # defaults (per-file values take precedence). Lets AIP inject each S3
+        # credential as its own env var instead of a nested `files[]` JSON.
+        for key in S3_DEFAULT_KEYS:
+            if self.file_config.get(key) in (None, "") and self.config.get(key) not in (
+                None,
+                "",
+            ):
+                self.file_config[key] = self.config[key]
 
         self._primary_keys: list[str] = self.file_config.get("keys", [])
 
