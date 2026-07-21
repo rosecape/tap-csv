@@ -64,6 +64,20 @@ class TapCSV(Tap):
                         "s3_secret_access_key", th.StringType, required=False
                     ),
                     th.Property("s3_region", th.StringType, required=False),
+                    # --- rosecape fork: source file format ---
+                    # "csv" (default) reads delimited rows. "json" emits each
+                    # file/object as a single `_data` string cell holding the
+                    # raw JSON; flattening/typing is done downstream in dbt.
+                    th.Property(
+                        "s3_format",
+                        th.StringType,
+                        required=False,
+                        default="csv",
+                        description=(
+                            "Source file format: 'csv' (default) or 'json'. "
+                            "JSON mode emits one `_data` cell per file."
+                        ),
+                    ),
                 )
             ),
             description="An array of csv file stream settings.",
@@ -98,6 +112,13 @@ class TapCSV(Tap):
         th.Property("s3_access_key_id", th.StringType, required=False),
         th.Property("s3_secret_access_key", th.StringType, required=False),
         th.Property("s3_region", th.StringType, required=False),
+        th.Property(
+            "s3_format",
+            th.StringType,
+            required=False,
+            default="csv",
+            description="Source file format: 'csv' (default) or 'json'.",
+        ),
     ).to_dict()
 
     @classproperty
