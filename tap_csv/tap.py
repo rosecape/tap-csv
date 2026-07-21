@@ -68,11 +68,14 @@ class TapCSV(Tap):
                     # "csv" (default) reads delimited rows. "json" emits each
                     # file/object as a single `_data` string cell holding the
                     # raw JSON; flattening/typing is done downstream in dbt.
+                    # No `default` here on purpose: an injected per-file
+                    # default would shadow the top-level `s3_format` (the shape
+                    # AIP uses) and force CSV mode. The default lives on the
+                    # top-level property below; is_json falls back to it.
                     th.Property(
                         "s3_format",
                         th.StringType,
                         required=False,
-                        default="csv",
                         description=(
                             "Source file format: 'csv' (default) or 'json'. "
                             "JSON mode emits one `_data` cell per file."
