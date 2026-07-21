@@ -54,6 +54,12 @@ class CSVStream(Stream):
         """Init CSVStram."""
         # cache file_config so we dont need to go iterating the config list again later
         self.file_config = kwargs.pop("file_config")
+        # Rosecape fork: capture the tap reference BEFORE super().__init__().
+        # The SDK evaluates the (cached) schema during super().__init__(),
+        # before self.config is wired up and before the top-level s3_* fold —
+        # so is_json/is_s3 need a config source that is available this early.
+        # The tap (already constructed) carries the resolved top-level config.
+        self._tap_ref = kwargs.get("tap")
         self._file_paths: list[str] = []
         self._header: list[str] | None = None
         # Rosecape fork: S3 object key -> LastModified, populated during
@@ -92,8 +98,27 @@ class CSVStream(Stream):
         holding the raw JSON; all flattening and type coercion is done
         downstream in dbt (jsonb), mirroring the CSV mode's "emit strings,
         coerce in dbt" philosophy. The CSV code path is untouched.
+
+        Reads `s3_format` from the per-file config first, then falls back to
+        the top-level tap config. The fallback matters at construction /
+        DISCOVER time: top-level `s3_*` settings (the shape AIP injects via
+        TAP_CSV_S3_* env vars) are only folded into file_config AFTER
+        super().__init__(), but the SDK evaluates the schema DURING it — so a
+        file_config-only read would see "csv" and mis-discover the schema.
         """
-        return str(self.file_config.get("s3_format", "csv")).lower() == "json"
+        fmt = self.file_config.get("s3_format")
+        if fmt in (None, ""):
+            # Top-level tap config, via the tap reference captured in __init__
+            # (available during super().__init__(), unlike self.config).
+            tap_config = getattr(getattr(self, "_tap_ref", None), "config", None)
+            if tap_config:
+                fmt = tap_config.get("s3_format")
+        if fmt in (None, ""):
+            try:
+                fmt = self.config.get("s3_format")
+            except Exception:  # pragma: no cover - defensive; config not ready
+                fmt = None
+        return str(fmt or "csv").lower() == "json"
 
     @property
     def _default_search_pattern(self) -> str:
@@ -350,14 +375,22 @@ class CSVStream(Stream):
 
     @property
     def header(self) -> list[str]:
-        """Parse the header of the CSV file."""
+        """Parse the header of the CSV file (or the fixed JSON column set)."""
         if self._header is not None:
             return self._header
 
-        first_file = self.get_file_paths()[0]
-        for row in self.get_rows(first_file):
-            names = [str(col) for col in row]
-            break
+        if self.is_json:
+            # Rosecape fork: JSON mode has a fixed single-column shape
+            # (`_data`), so the header is known without reading a file. This
+            # also lets DISCOVER compute the schema WITHOUT listing S3 at
+            # construction time — where top-level s3_bucket isn't folded into
+            # file_config yet (see is_json). CSV mode is unchanged below.
+            names = ["_data"]
+        else:
+            first_file = self.get_file_paths()[0]
+            for row in self.get_rows(first_file):
+                names = [str(col) for col in row]
+                break
 
         if self.config.get("add_metadata_columns", False):
             names = [
