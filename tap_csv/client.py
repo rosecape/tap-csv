@@ -41,6 +41,9 @@ S3_DEFAULT_KEYS = (
     "s3_access_key_id",
     "s3_secret_access_key",
     "s3_region",
+    # Rosecape fork: "csv" (default) or "json". JSON mode emits each file as a
+    # single `_data` cell (raw JSON string); flattening/typing happens in dbt.
+    "s3_format",
 )
 
 
@@ -80,6 +83,23 @@ class CSVStream(Stream):
         """True when this stream reads from S3 instead of local files."""
         return bool(self.file_config.get("s3_bucket"))
 
+    @property
+    def is_json(self) -> bool:
+        """True when the stream reads JSON files instead of CSV rows.
+
+        Rosecape fork: gated on `s3_format == "json"` (default "csv"). When
+        enabled, each file/object is emitted as a single `_data` string cell
+        holding the raw JSON; all flattening and type coercion is done
+        downstream in dbt (jsonb), mirroring the CSV mode's "emit strings,
+        coerce in dbt" philosophy. The CSV code path is untouched.
+        """
+        return str(self.file_config.get("s3_format", "csv")).lower() == "json"
+
+    @property
+    def _default_search_pattern(self) -> str:
+        """Default S3 key basename pattern for the active format."""
+        return r".*\.json$" if self.is_json else r".*\.csv$"
+
     @cached_property
     def _s3_client(self):
         """Build a boto3 S3 client honoring optional endpoint_url + creds.
@@ -110,7 +130,7 @@ class CSVStream(Stream):
         """
         bucket = self.file_config["s3_bucket"]
         prefix = self.file_config.get("s3_prefix", "") or ""
-        pattern = self.file_config.get("s3_search_pattern") or r".*\.csv$"
+        pattern = self.file_config.get("s3_search_pattern") or self._default_search_pattern
         compiled = re.compile(pattern)
 
         keys: list[str] = []
@@ -146,6 +166,19 @@ class CSVStream(Stream):
             strict=self.file_config.get("strict", False),
         )
         yield from csv.reader(io.StringIO(text), dialect="tap_dialect")
+
+    def _read_file_text(self, file_path: str) -> str:
+        """Read a whole file/object as text (used by JSON source mode).
+
+        Rosecape fork: serves both S3 (boto3 GetObject) and local paths.
+        """
+        encoding = self.file_config.get("encoding") or "utf-8"
+        if self.is_s3:
+            bucket = self.file_config["s3_bucket"]
+            resp = self._s3_client.get_object(Bucket=bucket, Key=file_path)
+            return resp["Body"].read().decode(encoding)
+        with open(file_path, encoding=encoding) as f:
+            return f.read()
 
     # ------------------------------------------------------------------
 
@@ -243,7 +276,9 @@ class CSVStream(Stream):
             if not keys:
                 bucket = self.file_config["s3_bucket"]
                 prefix = self.file_config.get("s3_prefix", "")
-                pattern = self.file_config.get("s3_search_pattern", r".*\.csv$")
+                pattern = self.file_config.get(
+                    "s3_search_pattern", self._default_search_pattern
+                )
                 raise RuntimeError(
                     f"Stream '{self.name}' matched no S3 objects in "
                     f"s3://{bucket}/{prefix} with pattern {pattern}."
@@ -271,18 +306,30 @@ class CSVStream(Stream):
         return file_paths
 
     def is_valid_filename(self, file_path: str) -> bool:
-        """Return a boolean of whether the file includes CSV extension."""
+        """Return whether the file has the expected extension for the format."""
+        # Rosecape fork: JSON mode accepts .json; CSV mode unchanged (.csv).
+        ext = ".json" if self.is_json else ".csv"
         is_valid = True
-        if file_path[-4:] != ".csv":
+        if not file_path.endswith(ext):
             is_valid = False
-            self.logger.warning(f"Skipping non-csv file '{file_path}'")
+            self.logger.warning(f"Skipping non-{ext[1:]} file '{file_path}'")
             self.logger.warning(
-                "Please provide a CSV file that ends with '.csv'; e.g. 'users.csv'"
+                f"Please provide a {ext[1:].upper()} file that ends with '{ext}'."
             )
         return is_valid
 
     def get_rows(self, file_path: str) -> t.Iterable[list[t.Any]]:
-        """Return a generator of the rows in a particular CSV file/object."""
+        """Return a generator of the rows in a particular CSV/JSON file/object."""
+        # Rosecape fork: JSON source mode. Emit the whole file as a single
+        # `_data` cell — a header row (`_data`) followed by one data row (the
+        # raw JSON text). This reuses get_records' header-skip + dict(zip(...))
+        # machinery unchanged; the CSV code path below is untouched. dbt does
+        # the jsonb flattening / typing downstream.
+        if self.is_json:
+            yield ["_data"]
+            yield [self._read_file_text(file_path)]
+            return
+
         # Rosecape fork: S3 source mode reads via boto3 GetObject.
         if self.is_s3:
             yield from self._get_s3_rows(file_path)
