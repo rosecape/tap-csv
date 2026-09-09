@@ -27,6 +27,24 @@ SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
 SDC_SOURCE_LINENO_COLUMN = "_sdc_source_lineno"
 SDC_SOURCE_FILE_MTIME_COLUMN = "_sdc_source_file_mtime"
 
+# Rosecape fork: NUL bytes are stripped from every source file before parsing.
+#
+# `csv.reader` raises `_csv.Error: line contains NUL` the moment it meets a
+# 0x00, which aborts the whole sync. Worse, because the run dies, the Singer
+# bookmark is never advanced — so the stream stays stuck on that file on every
+# subsequent run rather than losing a single row.
+#
+# Exports out of SQL Server hit this routinely: a fixed-width `nchar` column
+# that was never written can carry embedded NULs into the CSV. Observed on
+# ESA's `mtech.HimSetterInventory` export, where 5.5% of 2,563 objects were
+# unreadable (scattered across 2015-2024), while two sibling exports in the
+# same bucket were clean.
+#
+# NUL is not legal payload in a text CSV, so dropping it loses nothing: the row
+# and field structure around it is preserved, and every other byte survives.
+NUL_TEXT = "\x00"
+NUL_BYTES = b"\x00"
+
 # Rosecape fork: top-level S3 settings that act as defaults for every file
 # entry. Deployment platforms (Meltano/AIP) inject one env var per setting
 # (TAP_CSV_S3_BUCKET, TAP_CSV_S3_ACCESS_KEY_ID, ...), each mapped to a vault
@@ -180,7 +198,8 @@ class CSVStream(Stream):
         bucket = self.file_config["s3_bucket"]
         encoding = self.file_config.get("encoding", "utf-8")
         resp = self._s3_client.get_object(Bucket=bucket, Key=key)
-        text = resp["Body"].read().decode(encoding)
+        # Strip NULs before decoding — see NUL_BYTES at the top of this module.
+        text = resp["Body"].read().replace(NUL_BYTES, b"").decode(encoding)
         csv.register_dialect(
             "tap_dialect",
             delimiter=self.file_config.get("delimiter", ","),
@@ -201,9 +220,9 @@ class CSVStream(Stream):
         if self.is_s3:
             bucket = self.file_config["s3_bucket"]
             resp = self._s3_client.get_object(Bucket=bucket, Key=file_path)
-            return resp["Body"].read().decode(encoding)
+            return resp["Body"].read().replace(NUL_BYTES, b"").decode(encoding)
         with open(file_path, encoding=encoding) as f:
-            return f.read()
+            return f.read().replace(NUL_TEXT, "")
 
     # ------------------------------------------------------------------
 
@@ -371,7 +390,13 @@ class CSVStream(Stream):
             strict=self.file_config.get("strict", False),
         )
         with open(file_path, encoding=encoding) as f:
-            yield from csv.reader(f, dialect="tap_dialect")
+            # Strip NULs line by line — see NUL_TEXT at the top of this module.
+            # csv.reader takes any iterable of strings, so filtering this way
+            # keeps the read streaming instead of slurping the whole file.
+            yield from csv.reader(
+                (line.replace(NUL_TEXT, "") for line in f),
+                dialect="tap_dialect",
+            )
 
     @property
     def header(self) -> list[str]:

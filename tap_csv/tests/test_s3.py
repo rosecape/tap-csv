@@ -254,3 +254,59 @@ def test_per_file_s3_setting_overrides_top_level(monkeypatch):
     }
     s = _make_stream(objs, monkeypatch=monkeypatch, cfg=cfg)
     assert s.file_config["s3_bucket"] == "per-file-bucket"
+
+
+# ---------------------------------------------------------------------------
+# NUL-byte tolerance (rosecape fork)
+# ---------------------------------------------------------------------------
+#
+# SQL Server exports can carry embedded NULs from fixed-width `nchar` columns.
+# Left alone, csv.reader raises `_csv.Error: line contains NUL` and kills the
+# whole sync — and since the run dies, the bookmark never advances, so the
+# stream is stuck on that object on every later run.
+
+_CSV_WITH_NUL = (
+    b"TransID,EntityID,Value\n"
+    b"1,a,10\n"
+    b"2,b\x00\x00\x00,20\n"          # NULs padding a fixed-width column
+    b"3,c,\x0030\n"                  # NUL leading a value
+)
+
+
+def test_s3_rows_with_nul_bytes_are_read(monkeypatch):
+    """An object containing NULs parses instead of blowing up the sync."""
+    objs = [_Obj("prod/2026/04/10/data.csv", _CSV_WITH_NUL,
+                 datetime(2026, 4, 10, tzinfo=timezone.utc))]
+    s = _make_stream(objs, monkeypatch=monkeypatch)
+
+    rows = list(s.get_rows("prod/2026/04/10/data.csv"))
+
+    # Header plus three data rows — nothing dropped.
+    assert len(rows) == 4
+    assert rows[0] == ["TransID", "EntityID", "Value"]
+
+
+def test_s3_nul_stripping_preserves_surrounding_data(monkeypatch):
+    """Only the NULs go; the field structure and every other byte survive."""
+    objs = [_Obj("prod/2026/04/10/data.csv", _CSV_WITH_NUL,
+                 datetime(2026, 4, 10, tzinfo=timezone.utc))]
+    s = _make_stream(objs, monkeypatch=monkeypatch)
+
+    rows = list(s.get_rows("prod/2026/04/10/data.csv"))
+
+    assert rows[1] == ["1", "a", "10"]
+    assert rows[2] == ["2", "b", "20"]    # trailing NUL padding removed
+    assert rows[3] == ["3", "c", "30"]    # leading NUL removed
+    for row in rows:
+        assert all("\x00" not in cell for cell in row)
+
+
+def test_s3_clean_object_is_unaffected(monkeypatch):
+    """The NUL filter is a no-op on objects that never had any."""
+    objs = [_Obj("prod/2026/04/10/data.csv", _CSV,
+                 datetime(2026, 4, 10, tzinfo=timezone.utc))]
+    s = _make_stream(objs, monkeypatch=monkeypatch)
+
+    rows = list(s.get_rows("prod/2026/04/10/data.csv"))
+
+    assert rows == [["TransID", "EntityID", "Value"], ["1", "a", "10"], ["2", "b", "20"]]
